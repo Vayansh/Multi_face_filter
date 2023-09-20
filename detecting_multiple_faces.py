@@ -1,22 +1,17 @@
 import cv2 as cv
 import numpy as np
 from numba import cuda
+from filters import *
 
-cam = cv.VideoCapture(0)
-face_cascade = cv.CascadeClassifier('haarcascade_frontalface_default.xml')
 
-filter = np.array([
-    [-1,-1,-1],
-    [-1,8,-1],
-    [-1,-1,-1]
-])
 
-bfilter = np.array([
-    [-5,0,5],
-    [-1,0,1],
-    [-5,0,5]
-])
+filter_list = [increase_brightness,decrease_brightness,sharpened,fft,frame_mixing,frame_mixing2,frame_edges,
+               fft2,frame_mixing21,frame_mixing22,fft3,frame_mixing3,frame_mixing32]
 
+
+# Real-time Tracking algorithm using LBP filter
+
+##  making a LBP filter for real time tracking of faces
 @cuda.jit
 def lbp(img,imgLBP):
     x,y = cuda.grid(2)
@@ -36,74 +31,112 @@ def lbp(img,imgLBP):
             pattern += (img[i + 1, j + 2] >= center) << 0
             imgLBP[i+1,j+1] = pattern
 
-def track(pos,previous):
-    min = []
-    for i in previous:
-        min.append()
-       
+## Function to make a LBP histogram 
+def get_histogram(lbpface):
+    histogram = []
+    for i in range(256):
+        histogram.append(np.count_nonzero(lbpface == i))
+    return histogram
 
-previous_img = []
-count = 0
-
-font = cv.FONT_HERSHEY_SIMPLEX
-  
-# org
-org = (50, 50)
-  
-# fontScale
-fontScale = 1
-   
-# Blue color in BGR
-color = (255, 0, 0)
-  
-# Line thickness of 2 px
-thickness = 2
-
-while True:
-    ret, frame = cam.read()
-    frame = cv.flip(frame,1)
-    ori = np.copy(frame)
-    gray = cv.cvtColor(frame,cv.COLOR_BGR2GRAY)
-    
-    faces = face_cascade.detectMultiScale(gray, scaleFactor = 1.1, minNeighbors = 5)
-    
-    # imgLBP = np.zeros_like(gray)
-    # gray = cuda.to_device(gray)
-    # imgLBP = cuda.to_device(imgLBP)
-
-    # lbp[128,128](gray,imgLBP)
-
-    # imgLBP = imgLBP.copy_to_host()
-    # imgLBP = imgLBP.astype(np.uint8)
-    
-    
-    # frame1 = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-    frame1 = (frame + cv.filter2D(frame,-1,bfilter)).astype(np.uint8)
-    
-    for (x,y,w,h) in faces:        
-        frame1 = cv.rectangle(frame1,(x,y),(x+w,y+h),color=(0,200,255),thickness=5)
-        face = cv.resize(gray[y:y+h,x:x+w],(170,170))
+## Function to get the object tracking by returning object id 
+def get_id(curr,previous,count):
+    mini_id = -1
+    mini = 2500000
+    for id,img in previous.items():
+        eclu = 0
+        for j in range(255):
+            eclu += (img[j]-curr[j])**2
+        if mini > np.sqrt(eclu):
+            mini = np.sqrt(eclu)
+            mini_id = id
         
-        lbpface = cuda.to_device(np.zeros_like(face))
-        face = cuda.to_device(face)
-        lbp[128,128](face,lbpface)
+    if mini != 2500000 and mini > 800:
+        previous[count] = curr
+        count+=1
+        return count, count
+    else:
+        previous[mini_id] = curr
+        return mini_id+1, count   
+
+
+if __name__ == '__main__':
+    cam = cv.VideoCapture(0)
+    face_cascade = cv.CascadeClassifier('haarcascade_frontalface_default.xml')
+    fps = cam.get(cv.CAP_PROP_FPS)
+    previous_img = dict()
+    count = 0
+
+    font = cv.FONT_HERSHEY_SIMPLEX
+    
+    MAX_FRAME_TO_DETECT = fps*5
+
+    ids_count = dict()
+    ids_filter = dict()
+    frame_count = 0
+    while True:
+        ret, frame = cam.read()
+        frame = cv.flip(frame,1)
+        ori = np.copy(frame)
+        gray = cv.cvtColor(frame,cv.COLOR_BGR2GRAY)
         
-        lbpface = lbpface.copy_to_host()
+        faces = face_cascade.detectMultiScale(gray, scaleFactor = 1.1, minNeighbors = 5)
         
-        if count != 0:
-            track((x,y,w,h),previous_img)
-        else:
-            previous_img = faces
-            count+=1
+        frame1 = frame
+        
+        idx = []
+        for (x,y,w,h) in faces:        
+            frame1 = cv.rectangle(frame1,(x,y),(x+w,y+h),color=(0,200,255),thickness=5)
+            face = cv.resize(gray[y:y+h,x:x+w],(170,170))
             
-        frame1[y+1:y+h-1,x+1:x+w-1] = cv.resize(lbpface,(h-2,w-2)).reshape(h-2,w-2,1)
+            lbpface = cuda.to_device(np.zeros_like(face))
+            face = cuda.to_device(face)
+            lbp[128,128](face,lbpface)
+            
+            lbpface = lbpface.copy_to_host()
+            
+            if len(previous_img) != 0:
+                id, count = get_id(get_histogram(lbpface),previous_img,count)
+                frame1 = cv.putText(frame1, f'{id}', (x,y-20), font,  1, (255, 0, 0), 2)    
+                idx.append(id)   
+            else:
+                previous_img[count] = get_histogram(lbpface) 
+                count+=1
+            
+            ffit = 0
+            try:
+                ffit = ids_filter[id](frame[y:y+h,x:x+w])
+            except:
+                ids_filter[id] = filter_list[np.random.choice(len(filter_list),1)[0]]
+            frame1[y:y+h,x:x+w] = ffit
+                
+                
+                
+        delete_arr = []
+        for id in previous_img.keys():
+            if id not in idx:
+                try:
+                    ids_count[id] += 1
+                except:
+                    ids_count[id] = 1
+                if ids_count[id] >= MAX_FRAME_TO_DETECT:
+                    delete_arr.append(id) 
+            else:
+                ids_count[id] = 0
         
-    cv.imshow("original",ori)
-    cv.imshow('Face Hidden',frame1)
-    # cv.imshow('LBP_filter',imgLBP)
-    if cv.waitKey(1) & 0xFF == ord('q'):
-        break
-cam.release()
+        # Deletion Loop
+        for i in delete_arr:
+            del previous_img[i]
+            del ids_count[i]
+         
+        cv.imshow("original",ori)
+        cv.imshow('Face Hidden',frame1)
+        # cv.imshow('LBP_filter',imgLBP)
+        k = cv.waitKey(1)
+        if k == ord('q'):
+            break
+        elif k == ord(' '):
+            cv.imwrite("output/out.jpg", frame1)
+    cam.release()
 
     
     
